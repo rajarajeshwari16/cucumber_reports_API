@@ -15,7 +15,7 @@ app = FastAPI()
 
 # Configure Gemini AI - FIXED THE API KEY SETUP
 # Set your API key directly or use environment variable
-GEMINI_API_KEY = "AIzaSyBUVh-avaPa4jJDVa1iYF5WIICzKXnEDzk"  # Your actual API key here
+GEMINI_API_KEY = ""  # Your actual API key here
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -360,4 +360,5 @@ url this http://localhost:8000/parse_failures
                     "error_analysis": "status code was: 500, expected: 200, response time in milliseconds: N/A, url: https://autotest01.acoscloud.no/api/websak/api/register/sakmaler, response: Response text not available",
                     "AI_error_analysis": "This error is due to an unhandled server-side exception within the `/api/websak/api/register/sakmaler` endpoint. The recommended action is to examine the server logs for the `autotest01.acoscloud.no` server to identify and address the underlying exception causing the 500 Internal Server Error.\n"
                 },
+
               
