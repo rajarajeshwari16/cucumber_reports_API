@@ -1,0 +1,363 @@
+gemini 
+
+from fastapi import FastAPI, File, UploadFile
+from bs4 import BeautifulSoup
+import uvicorn
+import re
+from collections import Counter
+from typing import List
+import google.generativeai as genai
+import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+app = FastAPI()
+
+# Configure Gemini AI - FIXED THE API KEY SETUP
+# Set your API key directly or use environment variable
+GEMINI_API_KEY = "AIzaSyBUVh-avaPa4jJDVa1iYF5WIICzKXnEDzk"  # Your actual API key here
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    print("Gemini API configured successfully with provided key")
+else:
+    print("Warning: GEMINI_API_KEY not configured")
+
+# Available models
+AVAILABLE_MODELS = [
+    "models/gemini-1.5-pro-latest",
+    "models/gemini-1.5-flash", 
+    "models/gemini-2.5-pro",
+    "models/gemini-2.5-flash"
+]
+SELECTED_MODEL = "models/gemini-1.5-flash"
+
+# Regex patterns
+FAILURE_LINE_PATTERN = re.compile(
+    r"(status code was:\s*(\d+),\s*expected:\s*(\d+),\s*response time in milliseconds:\s*(\d+),\s*url:\s*(\S+),\s*response:)",
+    re.IGNORECASE
+)
+ALT_FAILURE_PATTERN = re.compile(
+    r"Expected\s*:\s*(\d+);\s*But it was\s*:(\d+)",
+    re.IGNORECASE
+)
+CUCUMBER_URL_PATTERN = re.compile(r"(https?://[^\s\"']+)", re.IGNORECASE)
+FEATURE_LINE_PATTERN = re.compile(r"([A-Z]+-[A-Z]*\d+)\.feature", re.IGNORECASE)
+TEST_CASE_PATTERN = re.compile(r"\b([A-Z]+-[A-Z]*\d+)\b", re.IGNORECASE)
+ADDITIONAL_PATTERN = re.compile(r"\b([A-Z]{2,}-[A-Z]*\d+)\b", re.IGNORECASE)
+
+# Thread pool for AI API calls
+executor = ThreadPoolExecutor(max_workers=3)
+
+async def analyze_error_with_ai(status_code, expected_code, response_time, url, response_text, testcase_id):
+    """
+    Use Gemini AI to analyze the error and provide recommendations
+    """
+    if not GEMINI_API_KEY:
+        return "AI analysis unavailable: API key not configured"
+    
+    try:
+        # Create the prompt for Gemini
+        prompt = f"""
+        Analyze this API test failure and provide a concise technical analysis in the following format:
+        
+        "This error is due to [root cause]. The recommended action is to [recommended action]."
+        
+        Details:
+        - Test Case ID: {testcase_id}
+        - URL: {url}
+        - Expected Status Code: {expected_code}
+        - Actual Status Code: {status_code}
+        - Response Time: {response_time} ms
+        - Response: {response_text}
+        
+        Please provide a brief analysis focusing on:
+        1. The likely root cause of the HTTP {status_code} error
+        2. Specific recommended actions to resolve the issue
+        3. Keep it concise and technical (1-2 sentences max)
+        """
+        
+        # Run the AI call in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        
+        # Use the thread pool to execute the synchronous AI call
+        response = await loop.run_in_executor(
+            executor, 
+            lambda: genai.GenerativeModel(SELECTED_MODEL).generate_content(prompt)
+        )
+        
+        return response.text
+        
+    except Exception as e:
+        return f"AI analysis failed: {str(e)}"
+
+def parse_single_file(soup: BeautifulSoup):
+    results = []
+
+    # --- STEP 1: Build testcase → URL mapping ---
+    cucumber_urls = {}
+    for element in soup.find_all("div", class_="element"):
+        case_id = None
+        case_text = element.get_text(" ", strip=True)
+        match = (
+            FEATURE_LINE_PATTERN.search(case_text)
+            or TEST_CASE_PATTERN.search(case_text)
+            or ADDITIONAL_PATTERN.search(case_text)
+        )
+        if match:
+            case_id = match.group(1)
+
+        url = None
+        for output_div in element.find_all("div", class_="output"):
+            text_block = output_div.get_text(" ", strip=True)
+            url_match = CUCUMBER_URL_PATTERN.search(text_block)
+            if url_match:
+                url = url_match.group(1)
+                break
+
+        if case_id and url:
+            cucumber_urls[case_id] = url
+
+    # --- STEP 2: Parse failures from all text ---
+    all_text = soup.get_text(separator="\n", strip=True)
+    lines = all_text.splitlines()
+
+    for i, line in enumerate(lines):
+        match = FAILURE_LINE_PATTERN.search(line)
+        alt_match = ALT_FAILURE_PATTERN.search(line)
+
+        if match:
+            status_code = match.group(2)
+            expected_code = match.group(3)
+            response_time = match.group(4)
+            url = match.group(5)
+            response_text = line[match.end():].strip()
+        elif alt_match:
+            expected_code = alt_match.group(1)
+            status_code = alt_match.group(2)
+            response_time = "N/A"
+            url = "URL Not Found"
+            response_text = "Response text not available"
+        else:
+            continue
+
+        # Find nearest testcase ID
+        test_case_id = None
+        for j in range(max(0, i - 5), min(len(lines), i + 15)):
+            feat_match = FEATURE_LINE_PATTERN.search(lines[j])
+            if feat_match:
+                test_case_id = feat_match.group(1)
+                break
+            test_match = TEST_CASE_PATTERN.search(lines[j])
+            if test_match:
+                test_case_id = test_match.group(1)
+                break
+            additional_match = ADDITIONAL_PATTERN.search(lines[j])
+            if additional_match:
+                test_case_id = additional_match.group(1)
+                break
+
+        failure_type = f"HTTP {status_code} (expected {expected_code})"
+
+        # ✅ Use cucumber URL if exists
+        if test_case_id and test_case_id in cucumber_urls:
+            url = cucumber_urls[test_case_id]
+
+        error_analysis = f"status code was: {status_code}, expected: {expected_code}, response time in milliseconds: {response_time}, url: {url}, response: {response_text}"
+        
+        # Create the result object (AI analysis will be added later)
+        results.append({
+            "status_info": failure_type,
+            "testcase": test_case_id or "",
+            "url": url,
+            "error_analysis": error_analysis,
+            "AI_error_analysis": "Pending analysis..."  # Placeholder
+        })
+
+    # --- STEP 3: Add failures without status codes ---
+    reported_testcases = {f["testcase"] for f in results if f["testcase"]}
+
+    for element in soup.find_all("div", class_="element"):
+        case_id = None
+        case_text = element.get_text(" ", strip=True)
+        match = (
+            FEATURE_LINE_PATTERN.search(case_text)
+            or TEST_CASE_PATTERN.search(case_text)
+            or ADDITIONAL_PATTERN.search(case_text)
+        )
+        if match:
+            case_id = match.group(1)
+
+        if case_id and case_id not in reported_testcases:
+            url = cucumber_urls.get(case_id, "URL Not Found")
+            context_lines = element.get_text("\n", strip=True).splitlines()
+
+            results.append({
+                "status_info": "no status code",
+                "testcase": case_id,
+                "url": url,
+                "error_analysis": "\n".join(context_lines[:12]),
+                "AI_error_analysis": "No status code available for analysis"
+            })
+            reported_testcases.add(case_id)
+
+    # --- STEP 4: Deduplicate ---
+    unique_failures = {}
+    for failure in results:
+        testcase = failure["testcase"]
+        status_info = failure["status_info"]
+        if testcase:
+            unique_key = f"{testcase}_{status_info}"
+            if unique_key not in unique_failures:
+                unique_failures[unique_key] = failure
+
+    return list(unique_failures.values())
+
+async def enhance_with_ai_analysis(results):
+    """
+    Enhance each result with AI analysis
+    """
+    enhanced_results = []
+    
+    for result in results:
+        # Skip AI analysis for cases without proper error data
+        if result["status_info"] == "no status code":
+            enhanced_results.append(result)
+            continue
+            
+        # Extract data for AI analysis
+        status_match = re.search(r"HTTP (\d+) \(expected (\d+)\)", result["status_info"])
+        if status_match:
+            status_code = status_match.group(1)
+            expected_code = status_match.group(2)
+            
+            # Extract response time from error_analysis if available
+            time_match = re.search(r"response time in milliseconds: (\d+)", result["error_analysis"])
+            response_time = time_match.group(1) if time_match else "N/A"
+            
+            # Extract response text
+            response_match = re.search(r"response: (.+)$", result["error_analysis"])
+            response_text = response_match.group(1) if response_match else "No response text"
+            
+            # Extract URL
+            url_match = re.search(r"url: (\S+),", result["error_analysis"])
+            url = url_match.group(1) if url_match else result["url"]
+            
+            # Get AI analysis
+            ai_analysis = await analyze_error_with_ai(
+                status_code, expected_code, response_time, 
+                url, response_text, result["testcase"]
+            )
+            
+            # Update result with AI analysis
+            result["AI_error_analysis"] = ai_analysis
+        
+        enhanced_results.append(result)
+    
+    return enhanced_results
+
+@app.post("/parse_failures")
+async def parse_failures(files: List[UploadFile] = File(...)):
+    all_results = []
+
+    for idx, file in enumerate(files, start=1):
+        contents = await file.read()
+        soup = BeautifulSoup(contents, "html.parser")
+        parsed_results = parse_single_file(soup)
+        
+        # Enhance with AI analysis
+        enhanced_results = await enhance_with_ai_analysis(parsed_results)
+        
+        # Count status types
+        status_counts = Counter(f["status_info"] for f in enhanced_results)
+
+        all_results.append({
+            "file_id": f"file_{idx}",
+            "filename": file.filename,
+            "total_unique": len(enhanced_results),
+            "status_summary": dict(status_counts),
+            "failures": enhanced_results
+        })
+
+    return {
+        "files_processed": len(all_results),
+        "results": all_results
+    }
+
+@app.get("/")
+async def root():
+    return {
+        "message": "API Test Failure Analyzer with Gemini AI",
+        "available_models": AVAILABLE_MODELS,
+        "selected_model": SELECTED_MODEL,
+        "status": "API_KEY_CONFIGURED" if GEMINI_API_KEY else "API_KEY_MISSING"
+    }
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+----
+url this http://localhost:8000/parse_failures
+
+{
+    "files_processed": 1,
+    "results": [
+        {
+            "file_id": "file_1",
+            "filename": "overview-failures.html",
+            "total_unique": 23,
+            "status_summary": {
+                "HTTP 500 (expected 200)": 21,
+                "HTTP 200 (expected 500)": 1,
+                "HTTP 400 (expected 200)": 1
+            },
+            "failures": [
+                {
+                    "status_info": "HTTP 500 (expected 200)",
+                    "testcase": "WFH-T2639",
+                    "url": "https://autotest01.acoscloud.no/api/websak/api/register/sakmaler",
+                    "error_analysis": "status code was: 500, expected: 200, response time in milliseconds: N/A, url: https://autotest01.acoscloud.no/api/websak/api/register/sakmaler, response: Response text not available",
+                    "AI_error_analysis": "This error is due to an unhandled exception or internal server error within the `/api/websak/api/register/sakmaler` endpoint.  The recommended action is to examine the application server logs for detailed error messages and debug the  `register/sakmaler`  API endpoint's code for the cause of the exception.\n"
+                },
+                {
+                    "status_info": "HTTP 500 (expected 200)",
+                    "testcase": "WFH-T2640",
+                    "url": "https://autotest01.acoscloud.no/api/websak/api/register/sakmaler",
+                    "error_analysis": "status code was: 500, expected: 200, response time in milliseconds: N/A, url: https://autotest01.acoscloud.no/api/websak/api/register/sakmaler, response: Response text not available",
+                    "AI_error_analysis": "This error is due to an unhandled exception or internal server error within the `/api/websak/api/register/sakmaler` endpoint. The recommended action is to review server logs for the `autotest01.acoscloud.no` server to identify and correct the underlying code causing the 500 error.\n"
+                },
+                {
+                    "status_info": "HTTP 500 (expected 200)",
+                    "testcase": "TC-6912",
+                    "url": "https://autotest01.acoscloud.no/api/websak/api/register/sakmaler",
+                    "error_analysis": "status code was: 500, expected: 200, response time in milliseconds: N/A, url: https://autotest01.acoscloud.no/api/websak/api/register/sakmaler, response: Response text not available",
+                    "AI_error_analysis": "This error is due to an unhandled exception or internal server error within the `/api/websak/api/register/sakmaler` endpoint. The recommended action is to examine the application server logs for detailed error messages to identify and correct the underlying code issue causing the 500 error.\n"
+                },
+                {
+                    "status_info": "HTTP 500 (expected 200)",
+                    "testcase": "TC-6913",
+                    "url": "https://autotest01.acoscloud.no/api/websak/api/register/sakmaler",
+                    "error_analysis": "status code was: 500, expected: 200, response time in milliseconds: N/A, url: https://autotest01.acoscloud.no/api/websak/api/register/sakmaler, response: Response text not available",
+                    "AI_error_analysis": "This error is due to an unhandled server-side exception on the `/api/websak/api/register/sakmaler` endpoint. The recommended action is to review server logs for the `autotest01.acoscloud.no` server at the time of the failure to identify and correct the underlying code defect causing the 500 error.\n"
+                },
+                {
+                    "status_info": "HTTP 500 (expected 200)",
+                    "testcase": "TC-6914",
+                    "url": "https://autotest01.acoscloud.no/api/websak/api/register/sakmaler",
+                    "error_analysis": "status code was: 500, expected: 200, response time in milliseconds: N/A, url: https://autotest01.acoscloud.no/api/websak/api/register/sakmaler, response: Response text not available",
+                    "AI_error_analysis": "This error is due to an unhandled server-side exception within the `/api/websak/api/register/sakmaler` endpoint. The recommended action is to examine the server logs for detailed error messages and implement appropriate exception handling and/or bug fixes in the backend application.\n"
+                },
+                {
+                    "status_info": "HTTP 500 (expected 200)",
+                    "testcase": "TC-6917",
+                    "url": "https://autotest01.acoscloud.no/api/websak/api/register/sakmaler",
+                    "error_analysis": "status code was: 500, expected: 200, response time in milliseconds: N/A, url: https://autotest01.acoscloud.no/api/websak/api/register/sakmaler, response: Response text not available",
+                    "AI_error_analysis": "This error is due to an unhandled server-side exception within the `/api/websak/api/register/sakmaler` endpoint. The recommended action is to review server logs for the `autotest01.acoscloud.no` server  to identify and debug the exception causing the 500 Internal Server Error.\n"
+                },
+                {
+                    "status_info": "HTTP 500 (expected 200)",
+                    "testcase": "TC-6918",
+                    "url": "https://autotest01.acoscloud.no/api/websak/api/register/sakmaler",
+                    "error_analysis": "status code was: 500, expected: 200, response time in milliseconds: N/A, url: https://autotest01.acoscloud.no/api/websak/api/register/sakmaler, response: Response text not available",
+                    "AI_error_analysis": "This error is due to an unhandled server-side exception within the `/api/websak/api/register/sakmaler` endpoint. The recommended action is to examine the server logs for the `autotest01.acoscloud.no` server to identify and address the underlying exception causing the 500 Internal Server Error.\n"
+                },
+              
